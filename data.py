@@ -7,6 +7,7 @@ import numpy as np
 import os
 import torch
 import torchvision.transforms as transforms
+import glob
 
 
 class SpokenDigits(Dataset):
@@ -28,7 +29,7 @@ class SpokenDigits(Dataset):
             specgram = self.transform(specgram)
         specgram = specgram.type(torch.FloatTensor)
         label = torch.LongTensor([label])
-        return specgram, label
+        return specgram #, label
 
     def __len__(self):
         return len(self.files)
@@ -59,6 +60,47 @@ def spoken_digits_loader(mel_path, batch_size, num_frames, num_mels):
     )
     dataset = SpokenDigits(mel_dir=mel_path, num_mels=num_mels, transform=composed)
     return DataLoader(dataset, batch_size, shuffle=True, drop_last=True)
+
+
+class LibriSpeech(Dataset):
+    def __init__(self, data_path, subset='train-clean-100', num_frames=128):
+        '''
+        :param data_path: path the mel features
+        :param subset: can be 'train-clean-100', 'train-clean-360', '*'
+        :param num_frames:
+        '''
+        self.files = glob.glob(os.path.join(data_path, subset, '*.npy'))
+        self.num_frames = num_frames
+
+    def __len__(self):
+        return len(self.files)
+
+    def fit_size(self, x, thr, idx):
+        if x.shape[1] < self.num_frames:
+            lp = np.random.randint(self.num_frames-x.shape[1])
+            x_ = np.pad(x, ((0, 0), (lp, self.num_frames-x.shape[1]-lp)),
+                       'constant', constant_values=((0, 0), (0, 0)))
+        elif x.shape[1] > self.num_frames:
+            cnt = 0
+            while cnt < 20:
+                st = np.random.randint(x.shape[1]-self.num_frames)
+                x_ = x[:, st:st+self.num_frames]
+                if x_.sum(axis=0).mean() > thr:
+                    break
+                cnt += 1
+            if cnt >=20:
+                print('Warning: {} could be silence'.format(self.files[idx]))
+        else:
+            x_ = x
+        return x_
+
+    def __getitem__(self, idx):
+        x = np.load(self.files[idx])
+        x = self.fit_size(x, thr=21, idx=idx)
+        x = torch.from_numpy(x).float().unsqueeze(0)
+        return x
+
+
 
 
 class Nancy16(Dataset):

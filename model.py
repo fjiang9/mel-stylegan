@@ -336,8 +336,8 @@ class ToRGB(nn.Module):
         if upsample:
             self.upsample = Upsample(blur_kernel)
 
-        self.conv = ModulatedConv2d(in_channel, 3, 1, style_dim, demodulate=False)
-        self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
+        self.conv = ModulatedConv2d(in_channel, 1, 1, style_dim, demodulate=False)
+        self.bias = nn.Parameter(torch.zeros(1, 1, 1, 1))
 
     def forward(self, input, style, skip=None):
         out = self.conv(input, style)
@@ -376,7 +376,7 @@ class Generator(nn.Module):
                 )
             )
 
-        self.style = nn.Sequential(*layers)
+        self.style = nn.Sequential(*layers) # mapping network
 
         self.channels = {
             4: 512,
@@ -437,14 +437,17 @@ class Generator(nn.Module):
 
         self.n_latent = self.log_size * 2 - 2
 
-    def make_noise(self):
+        self.start_layer = 0
+        self.end_layer = self.log_size - 2
+
+    def make_noise(self, bs):
         device = self.input.input.device
 
-        noises = [torch.randn(1, 1, 2 ** 2, 2 ** 2, device=device)]
+        noises = [torch.randn(bs, 1, 2 ** 2, 2 ** 2, device=device)]
 
         for i in range(3, self.log_size + 1):
             for _ in range(2):
-                noises.append(torch.randn(1, 1, 2 ** i, 2 ** i, device=device))
+                noises.append(torch.randn(bs, 1, 2 ** i, 2 ** i, device=device))
 
         return noises
 
@@ -469,9 +472,11 @@ class Generator(nn.Module):
         input_is_latent=False,
         noise=None,
         randomize_noise=True,
+        layer_in=None,
+        skip=None,
     ):
         if not input_is_latent:
-            styles = [self.style(s) for s in styles]
+            styles = [self.style(s) for s in styles] # z -> w
 
         if noise is None:
             if randomize_noise:
@@ -508,20 +513,45 @@ class Generator(nn.Module):
             latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
 
             latent = torch.cat([latent, latent2], 1)
-
         out = self.input(latent)
-        out = self.conv1(out, latent[:, 0], noise=noise[0])
 
-        skip = self.to_rgb1(out, latent[:, 1])
+        # out = self.conv1(out, latent[:, 0], noise=noise[0])
+        # skip = self.to_rgb1(out, latent[:, 1])
+        # i = 1
+        # for conv1, conv2, noise1, noise2, to_rgb in zip(
+        #     self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2], self.to_rgbs
+        # ):
+        #     out = conv1(out, latent[:, i], noise=noise1)
+        #     out = conv2(out, latent[:, i + 1], noise=noise2)
+        #     skip = to_rgb(out, latent[:, i + 2], skip)
+        #
+        #     i += 2
+        #
+        # image = skip
 
+        if self.start_layer == 0:
+            out = self.conv1(out, latent[:, 0], noise=noise[0])  # 0th layer
+            skip = self.to_rgb1(out, latent[:, 1])
+        if self.end_layer == 0:
+            return out, skip
         i = 1
+        current_layer = 1
         for conv1, conv2, noise1, noise2, to_rgb in zip(
-            self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2], self.to_rgbs
+                self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2], self.to_rgbs
         ):
-            out = conv1(out, latent[:, i], noise=noise1)
-            out = conv2(out, latent[:, i + 1], noise=noise2)
-            skip = to_rgb(out, latent[:, i + 2], skip)
-
+            if current_layer < self.start_layer:
+                pass
+            elif current_layer == self.start_layer:
+                out = conv1(layer_in, latent[:, i], noise=noise1)
+                out = conv2(out, latent[:, i + 1], noise=noise2)
+                skip = to_rgb(out, latent[:, i + 2], skip)
+            elif current_layer > self.end_layer:
+                return out, skip
+            else:
+                out = conv1(out, latent[:, i], noise=noise1)
+                out = conv2(out, latent[:, i + 1], noise=noise2)
+                skip = to_rgb(out, latent[:, i + 2], skip)
+            current_layer += 1
             i += 2
 
         image = skip
@@ -615,7 +645,7 @@ class Discriminator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
-        convs = [ConvLayer(3, channels[size], 1)]
+        convs = [ConvLayer(1, channels[size], 1)]
 
         log_size = int(math.log(size, 2))
 

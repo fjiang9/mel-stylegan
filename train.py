@@ -2,12 +2,17 @@ import argparse
 import math
 import random
 import os
+import sys
+import yaml
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import numpy as np
 import torch
 from torch import nn, autograd, optim
 from torch.nn import functional as F
 from torch.utils import data
+from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
@@ -19,7 +24,7 @@ except ImportError:
     wandb = None
 
 from model import Generator, Discriminator
-from data import spoken_digits_loader
+from data import spoken_digits_loader, LibriSpeech
 from distributed import (
     get_rank,
     synchronize,
@@ -28,6 +33,7 @@ from distributed import (
     get_world_size,
 )
 from non_leaking import augment, AdaptiveAugment
+from generate import save_images
 
 
 def data_sampler(dataset, shuffle, distributed):
@@ -297,15 +303,18 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                 with torch.no_grad():
                     g_ema.eval()
                     sample, _ = g_ema([sample_z])
-                    utils.save_image(
-                        sample,
-                        f"sample/{str(i).zfill(6)}.png",
-                        nrow=int(args.n_sample ** 0.5),
-                        normalize=True,
-                        range=(-1, 1),
-                    )
+                    # utils.save_image(
+                    #     sample,
+                    #     f"sample/{str(i).zfill(6)}.png", ########### where to save ###########
+                    #     nrow=int(args.n_sample ** 0.5),
+                    #     normalize=True,
+                    #     range=(-1, 1),
+                    # )
+                    save_images(sample.squeeze(1).detach().cpu(), f"{args.exp_dir}/samples/{str(i).zfill(6)}.png")
+                    if i % 1000 == 0:
+                        torch.save(sample.squeeze(1).detach().cpu(), f"{args.exp_dir}/samples/{str(i).zfill(6)}.pt")
 
-            if i % 10000 == 0:
+            if i % 5000 == 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
@@ -316,7 +325,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                         "args": args,
                         "ada_aug_p": ada_aug_p,
                     },
-                    f"checkpoint/{str(i).zfill(6)}.pt",
+                    f"{args.exp_dir}/checkpoints/{str(i).zfill(6)}.pt", ########### where to save ###########
                 )
 
 
@@ -325,9 +334,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
-    parser.add_argument("path", type=str, help="path to the lmdb dataset")
+    # parser.add_argument("path", type=str, help="path to the lmdb dataset")
     parser.add_argument(
-        "--iter", type=int, default=800000, help="total training iterations"
+        "--iter", type=int, default=150000, help="total training iterations"
     )
     parser.add_argument(
         "--batch", type=int, default=16, help="batch sizes for each gpus"
@@ -339,7 +348,16 @@ if __name__ == "__main__":
         help="number of the samples generated during training",
     )
     parser.add_argument(
-        "--size", type=int, default=256, help="image sizes for the model"
+        "--num_mels", type=int, default=128, help="number of mel bins"
+    )
+    parser.add_argument(
+        "--num_frames", type=int, default=128, help="number of frames"
+    )
+    parser.add_argument(
+        "--latent", type=int, default=512, help="dimension of the latent space"
+    )
+    parser.add_argument(
+        "--n_mlp", type=int, default=8, help="depth of the mapping network"
     )
     parser.add_argument(
         "--r1", type=float, default=10, help="weight of the r1 regularization"
@@ -370,6 +388,19 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mixing", type=float, default=0.9, help="probability of latent code mixing"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default='sc09',
+        help="training set",
+        choices=['sc09', 'librispeech']
+    )
+    parser.add_argument(
+        "--exp_dir",
+        type=str,
+        default='experiments/temp',
+        help="path to save the checkpoints",
     )
     parser.add_argument(
         "--ckpt",
@@ -428,19 +459,30 @@ if __name__ == "__main__":
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         synchronize()
 
-    args.latent = 512
-    args.n_mlp = 8
 
-    args.start_iter = 0
+    args.start_iter = 0 #if args.ckpt is None else int(args.ckpt.split('/')[-1].split('.')[0])+1
+
+    # Save config
+    args.exp_dir = os.path.join('experiments', args.exp_dir)
+    if os.path.exists(args.exp_dir):
+        res = input("{} already exists, continue? (y/n)".format(args.exp_dir))
+        print(res)
+        if res == 'n':
+            sys.exit()
+    os.makedirs(os.path.join(args.exp_dir, 'checkpoints'), exist_ok=True)
+    os.makedirs(os.path.join(args.exp_dir, 'samples'), exist_ok=True)
+    conf_path = os.path.join(args.exp_dir, 'conf.yml')
+    with open(conf_path, 'w') as outfile:
+        yaml.safe_dump(vars(args), outfile)
 
     generator = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.num_frames, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
     ).to(device)
     discriminator = Discriminator(
-        args.size, channel_multiplier=args.channel_multiplier
+        args.num_frames, channel_multiplier=args.channel_multiplier
     ).to(device)
     g_ema = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.num_frames, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
     ).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)
@@ -466,7 +508,7 @@ if __name__ == "__main__":
 
         try:
             ckpt_name = os.path.basename(args.ckpt)
-            args.start_iter = int(os.path.splitext(ckpt_name)[0])
+            args.start_iter = int(os.path.splitext(ckpt_name)[0])+1
 
         except ValueError:
             pass
@@ -493,21 +535,31 @@ if __name__ == "__main__":
             broadcast_buffers=False,
         )
 
-    transform = transforms.Compose(
-        [
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-        ]
-    )
+    # transform = transforms.Compose(
+    #     [
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
+    #     ]
+    # )
+    #
+    # dataset = MultiResolutionDataset(args.path, transform, args.num_frames)
+    # loader = data.DataLoader(
+    #     dataset,
+    #     batch_size=args.batch,
+    #     sampler=data_sampler(dataset, shuffle=True, distributed=args.distributed),
+    #     drop_last=True,
+    # )
 
-    dataset = MultiResolutionDataset(args.path, transform, args.size)
-    loader = data.DataLoader(
-        dataset,
-        batch_size=args.batch,
-        sampler=data_sampler(dataset, shuffle=True, distributed=args.distributed),
-        drop_last=True,
-    )
+    if args.dataset == 'sc09':
+        melspec_path = "/home/neil/fei/data/sc09_features/train/melspec_{num_mels}".format(num_mels=args.num_mels)
+        loader = spoken_digits_loader(melspec_path, args.batch, args.num_frames, args.num_mels)
+    elif args.dataset == 'librispeech':
+        dataset = LibriSpeech(data_path='/home/neil/fei/data/librispeech_mel', subset='*')
+        loader = DataLoader(dataset, args.batch, shuffle=True, drop_last=True)
+    else:
+        raise ValueError('dataset should be sc09 or librispeech!')
+
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
