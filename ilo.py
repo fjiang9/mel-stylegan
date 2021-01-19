@@ -17,7 +17,7 @@ from torch.nn import functional as F
 # from robustness import imagenet_models
 # from collections import OrderedDict
 # from utils import *
-
+from torch.optim import Optimizer
 
 def get_transformation(image_size):
     return transforms.Compose(
@@ -61,18 +61,55 @@ class SphericalOptimizer():
             param.mul_(self.radii[param])
 
 
+# class SphericalOptimizer(Optimizer):
+#     def __init__(self, optimizer, params, **kwargs):
+#         self.opt = optimizer(params, **kwargs)
+#         self.params = params
+#         with torch.no_grad():
+#             self.radii = {param: (param.pow(2).sum(tuple(range(2,param.ndim)),keepdim=True)+1e-9).sqrt() for param in params}
+#
+#     @torch.no_grad()
+#     def step(self, closure=None):
+#         loss = self.opt.step(closure)
+#         for param in self.params:
+#             param.data.div_((param.pow(2).sum(tuple(range(2,param.ndim)),keepdim=True)+1e-9).sqrt())
+#             param.mul_(self.radii[param])
+#
+#         return loss
+
+
 class LatentOptimizer(torch.nn.Module):
-    def __init__(self, x, gma, device, lr=0.1, steps='1000',
-                 task='invert', search_w=True, search_noise=True, project=True,
+    def __init__(self, x, gma, device, lr=0.1, steps='1000', task='invert',
+                 search_space='W+', search_noise=True, project=True,
                  start_layer=0, end_layer=5, discriminator=None,
                  cls_alpha=0, mask=1, mse_weight=1, lpips_alpha=0, r_alpha=0.1):
+        """
+
+        :param x:
+        :param gma:
+        :param device:
+        :param lr:
+        :param steps:
+        :param task:
+        :param search_space: W, W+, Z, Z+
+        :param search_noise:
+        :param project:
+        :param start_layer:
+        :param end_layer:
+        :param discriminator:
+        :param cls_alpha:
+        :param mask:
+        :param mse_weight:
+        :param lpips_alpha:
+        :param r_alpha:
+        """
         super().__init__()
         # self.config = config
         # if config['image_size'][0] != config['image_size'][1]:
         #     raise Exception('Non-square images are not supported yet.')
  
         self.task = task
-        self.search_w = search_w
+        self.search_space = search_space
         self.search_noise = search_noise
         self.project = project
         self.steps = steps
@@ -118,11 +155,39 @@ class LatentOptimizer(torch.nn.Module):
         for p in self.gen.parameters():
             p.requires_grad = False
 
+        self.lrelu = torch.nn.LeakyReLU(negative_slope=0.2)
+        self.plrelu = torch.nn.LeakyReLU(negative_slope=5)
+
+        # if self.verbose: print("\tRunning Mapping Network")
+        with torch.no_grad():
+            torch.manual_seed(0)
+            # latent = torch.randn((1000000, 512), dtype=torch.float32, device="cuda")
+            # latent_out = torch.nn.LeakyReLU(5)(self.gen.style(latent))
+
+            latent_p = self.plrelu(self.gen.style(torch.randn((1000000, 512), dtype=torch.float32, device="cuda")))
+            self.mu = latent_p.mean(dim=0, keepdim=True)
+            self.Sigma = (latent_p - self.mu).T @ (latent_p - self.mu) / latent_p.shape[0]
+            self.mu = self.mu.to(device)
+            self.Sigma = self.Sigma.to(device)
+            self.gaussian_fit = {"mean": latent_p.mean(0).to(device), "std": latent_p.std(0).to(device)}
+            # u, s, v = torch.svd(latent_p - self.mu)
+            d, V = np.linalg.eigh(self.Sigma)
+            # small eigenvalues do not get overamplified.
+            D = np.diag(1. / np.sqrt(d + 1e-18))
+            # whitening matrix
+            # W = np.dot(np.dot(V, D), V.T) # ZCA whitening
+            W = np.dot(np.dot(V, D))  # PCA whitening
+            self.W = torch.from_numpy(W).to(device) # X_white = X @ W
+
+            del latent_p
+            torch.cuda.empty_cache()
+
 
         # self.mpl = MappingProxy(torch.load('gaussian_fit.pt'))
 
         self.percept = lpips.PerceptualLoss(model="net-lin", net="vgg",
                                             use_gpu=device.startswith("cuda"))
+
 
         # # load a classifier
         # self.cls = imagenet_models.resnet50()
@@ -147,24 +212,38 @@ class LatentOptimizer(torch.nn.Module):
             self.noises = []
             for noise in noises_single:
                 self.noises.append(noise.normal_())
-            if self.search_w:
-                # self.latent_z = torch.randn(
-                #             (bs, self.gen.n_latent, self.gen.style_dim),
-                #             dtype=torch.float,
-                #             requires_grad=True, device='cuda')
-                with torch.no_grad():
-                    self.latent_z = self.gen.style(torch.randn((bs, self.gen.n_latent, self.gen.style_dim)).to(device))
-                self.latent_z.requires_grad = True
-            else:
+            if self.search_space == 'W':
+                # # self.latent_z = torch.randn(
+                # #             (bs, self.gen.n_latent, self.gen.style_dim),
+                # #             dtype=torch.float,
+                # #             requires_grad=True, device='cuda')
+                # with torch.no_grad():
+                #     self.latent_z = self.gen.style(F.normalize(torch.randn(bs, self.gen.n_latent, self.gen.style_dim), p=2, dim=2).to(device)) # random w
+                #     # self.latent_z = self.gen.style(F.normalize(torch.randn(bs, 1, self.gen.style_dim), p=2, dim=2).repeat(1, self.gen.n_latent, 1).to(device))  # random w
+                #     # self.latent_z = self.gen.mean_latent(16384).unsqueeze(1).repeat(bs, self.gen.n_latent, 1).to(device) # mean w
+                # self.latent_z.requires_grad = True
+                # Generate latent tensor
+                self.latent = torch.randn((bs, 1, self.gen.style_dim), dtype=torch.float, requires_grad=True, device='cuda')
+            elif self.search_space == 'W+':
+                self.latent = torch.randn((bs, self.gen.n_latent, self.gen.style_dim), dtype=torch.float, requires_grad=True, device='cuda')
+            elif self.search_space == 'Z':
+                self.latent = torch.randn(
+                    (bs, 1, self.gen.style_dim),
+                    dtype=torch.float,
+                    requires_grad=True, device='cuda')
+            elif self.search_space == 'Z+':
                 # self.latent_z = torch.randn(
                 #             (bs, self.gen.style_dim),
                 #             dtype=torch.float,
                 #             requires_grad=True, device='cuda')
-
                 self.latent_z = torch.randn(
                     (bs, self.gen.n_latent, self.gen.style_dim),
                     dtype=torch.float,
                     requires_grad=True, device='cuda')
+                self.latent_w = self.gen.style(self.latent_z)
+            else:
+                raise ValueError("searching_space incorrect")
+
             self.gen_outs = [None]
         else:
             # restore noises
@@ -190,11 +269,11 @@ class LatentOptimizer(torch.nn.Module):
 
         with torch.no_grad():
             if start_layer == 0:
-                var_list = [self.latent_z] + [self.scalar]
+                var_list = [self.latent] #+ [self.scalar]
             else:
                 # intermediate_out = torch.ones(self.gen_outs[-1].shape, device=self.gen_outs[-1].device) * self.gen_outs[-1]
                 # intermediate_out.requires_grad = True
-                var_list = [self.latent_z] + [self.scalar] + [self.gen_outs[-1]]
+                var_list = [self.latent] + [self.gen_outs[-1]] #+ [self.scalar]
             if self.search_noise:
                 var_list += self.noises
 
@@ -203,7 +282,7 @@ class LatentOptimizer(torch.nn.Module):
             self.gen.end_layer = self.end_layer
 
         optimizer = optim.Adam(var_list, lr=self.lr)
-        ps = SphericalOptimizer([self.latent_z] + self.noises)
+        ps = SphericalOptimizer([self.latent] + self.noises)
         pbar = tqdm(range(steps))
         self.current_step += steps
 
@@ -220,12 +299,18 @@ class LatentOptimizer(torch.nn.Module):
         no_improve = 0
         for i in pbar:
             t = i / steps
-            lr = self.get_lr(t, self.lr) #* (0.1**(start_layer))
+            # lr = self.get_lr(t, self.lr) #* (0.1**(start_layer))
+            lr = self.lr * (0.1**(start_layer))
             optimizer.param_groups[0]["lr"] = lr
             self.lr_record.append(lr)
-            # latent_w = self.mpl(self.latent_z)
-            if self.search_w:
-                latent_w = self.latent_z
+            if self.search_space == "W":
+                latent_w = self.lrelu(self.latent* self.gaussian_fit["std"] + self.gaussian_fit["mean"]).repeat(1, self.gen.n_latent, 1)
+                # latent_w = self.latent_z
+                # latent_w = self.mpl(self.latent_z)
+                # latent_w = self.lrelu(self.latent_z * self.gaussian_fit["std"] + self.gaussian_fit["mean"])
+            elif self.search_space == "W+":
+                # latent_w = self.lrelu(self.latent)
+                latent_w = self.lrelu(self.latent * self.gaussian_fit["std"] + self.gaussian_fit["mean"])
             else:
                 latent_w = self.gen.style(self.latent_z)
             img_gen, _ = self.gen([latent_w],
@@ -298,7 +383,7 @@ class LatentOptimizer(torch.nn.Module):
             #     self.config['pe'] * p_loss +  self.config['mse'] * mse_loss + \
             #     self.config['geocross'] * loss_geocross(self.latent_z[2 * start_layer:])
 
-
+            mse_loss = 10 * torch.log10(mse_loss)
             loss = mse_loss + self.lpips_alpha * p_loss
             res.append(mse_loss.detach().cpu().item())
 
@@ -306,12 +391,14 @@ class LatentOptimizer(torch.nn.Module):
                 cls_loss = F.softplus(-self.discriminator(img_gen)).mean()
                 loss = loss + self.cls_alpha * cls_loss
 
-            if not self.search_w:
+            if self.search_space in ["Z", "Z+"]:
                 r_loss = self.latent_z.pow(2).mean()
                 loss = loss + self.r_alpha * r_loss
-            else:
-                r_loss = loss_geocross(self.latent_z[:, 2 * start_layer:], self.gen.style_dim)
+            elif self.search_space in ["W+"]:
+                r_loss = loss_geocross(latent_w[:, 2 * start_layer:], self.gen.style_dim)
                 loss = loss + self.r_alpha * r_loss
+            else:
+                r_loss = torch.tensor(0., device='cuda')
 
             # if self.task == 'separate':
             #     loss = loss - 0.001 * (10**(5*img_gen[0]-4) + 10**(5*img_gen[1]-4)).pow(2).sum()
@@ -357,10 +444,10 @@ class LatentOptimizer(torch.nn.Module):
         # TODO: check what happens when we are in the last layer
         with torch.no_grad():
             # latent_w = self.mpl(self.latent_z)
-            if self.search_w:
-                latent_w = self.latent_z
-            else:
-                latent_w = self.gen.style(self.latent_z)
+            if self.search_space == "W":
+                latent_w = self.lrelu(self.latent).repeat(1, self.gen.n_latent, 1)
+            if self.search_space == 'W+':
+                latent_w = self.lrelu(self.latent)
             self.gen.end_layer = self.gen.start_layer
             intermediate_out, _  = self.gen([latent_w],
                                              input_is_latent=True,
@@ -382,4 +469,4 @@ class LatentOptimizer(torch.nn.Module):
             res = self.invert_(begin_from, range(5 + 2 * begin_from), int(steps), res)
             # self.invert_(begin_from, range(3 + 2 * begin_from), int(steps))
         self.best[self.best<0] = 0
-        return self.original_imgs, (self.latent_z, self.noises, self.gen_outs), self.best, res
+        return self.original_imgs, (self.latent, self.noises, self.gen_outs), self.best, res

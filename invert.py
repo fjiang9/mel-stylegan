@@ -74,15 +74,15 @@ def inverse(x, generator, mean_latent, lr=0.01, iter=500, task='invert'):
     return x_hat, res
 
 
-def ilo_inverse(x, generator, device, lr=0.1, task='invert', search_w=True, search_noise=True,
+def ilo_inverse(x, generator, device, lr=0.1, task='invert', search_space='W+', search_noise=False,
                 steps='1000,500,500,500,500', start_layer=0, end_layer=5, mse_weight=1,
                 discriminator=None, cls_alpha=0, mask=1, lpips_alpha=0, r_alpha=0.1):
-    ilo_optimizer = LatentOptimizer(x, generator, device, steps=steps, lr=lr, task=task, search_w=search_w,
-                                    search_noise=search_noise, project=False, start_layer=start_layer, end_layer=end_layer,
+    ilo_optimizer = LatentOptimizer(x, generator, device, steps=steps, lr=lr, task=task, search_space=search_space,
+                                    search_noise=search_noise, project=True, start_layer=start_layer, end_layer=end_layer,
                                     discriminator=discriminator, cls_alpha=cls_alpha, mask=mask, mse_weight=mse_weight,
                                     lpips_alpha=lpips_alpha, r_alpha=r_alpha)
     inputs, z, images, res = ilo_optimizer.invert()
-    return images, res
+    return images, res, ilo_optimizer
 
 
 def compare_inverse(x, x_hat, res=None):
