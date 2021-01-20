@@ -102,4 +102,21 @@ def compare_inverse(x, x_hat, res=None):
     ipd.display(ipd.Audio(wav_hat, rate=16000))
 
 
+def compare_mels(*mels, res=None):
+    wavs = []
+    for m in mels:
+        wavs.append(mels_to_wav(m.unsqueeze(0)))
+    plt.figure(figsize=[4*len(mels), 8])
+    if res is not None:
+        plt.subplot(2, 1, 1)
+        plt.plot(res)
+        plt.grid()
+    for i, m in enumerate(mels):
+        plt.subplot(2, len(mels), len(mels)+i+1)
+        plt.imshow(m.detach().cpu(), origin='lower', cmap='magma')
+    plt.show()
+    for w in wavs:
+        ipd.display(ipd.Audio(w, rate=16000))
+
+
 

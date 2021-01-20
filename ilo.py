@@ -160,24 +160,25 @@ class LatentOptimizer(torch.nn.Module):
 
         # if self.verbose: print("\tRunning Mapping Network")
         with torch.no_grad():
-            torch.manual_seed(0)
+            # torch.manual_seed(0)
             # latent = torch.randn((1000000, 512), dtype=torch.float32, device="cuda")
             # latent_out = torch.nn.LeakyReLU(5)(self.gen.style(latent))
 
-            latent_p = self.plrelu(self.gen.style(torch.randn((1000000, 512), dtype=torch.float32, device="cuda")))
+            latent_p = self.plrelu(self.gen.style(torch.randn((500000, 512), dtype=torch.float32, device="cuda"))).double()
             self.mu = latent_p.mean(dim=0, keepdim=True)
             self.Sigma = (latent_p - self.mu).T @ (latent_p - self.mu) / latent_p.shape[0]
-            self.mu = self.mu.to(device)
-            self.Sigma = self.Sigma.to(device)
-            self.gaussian_fit = {"mean": latent_p.mean(0).to(device), "std": latent_p.std(0).to(device)}
-            # u, s, v = torch.svd(latent_p - self.mu)
-            d, V = np.linalg.eigh(self.Sigma)
+            d, V = torch.symeig(self.Sigma, eigenvectors=True)
             # small eigenvalues do not get overamplified.
-            D = np.diag(1. / np.sqrt(d + 1e-18))
+            D = torch.diag(1. / torch.sqrt(d + 1e-18))
             # whitening matrix
             # W = np.dot(np.dot(V, D), V.T) # ZCA whitening
-            W = np.dot(np.dot(V, D))  # PCA whitening
-            self.W = torch.from_numpy(W).to(device) # X_white = X @ W
+            self.W = (V @ D).float()  # PCA whitening
+            self.W_inv = torch.inverse(self.W)
+
+            latent_p = latent_p.float()
+            self.mu = self.mu.float().unsqueeze(0).to(device)
+            self.Sigma = self.Sigma.float().to(device)
+            self.gaussian_fit = {"mean": latent_p.mean(0).to(device), "std": latent_p.std(0).to(device)}
 
             del latent_p
             torch.cuda.empty_cache()
@@ -226,6 +227,9 @@ class LatentOptimizer(torch.nn.Module):
                 self.latent = torch.randn((bs, 1, self.gen.style_dim), dtype=torch.float, requires_grad=True, device='cuda')
             elif self.search_space == 'W+':
                 self.latent = torch.randn((bs, self.gen.n_latent, self.gen.style_dim), dtype=torch.float, requires_grad=True, device='cuda')
+                # with torch.no_grad():
+                #     self.latent = self.gen.style(torch.randn(bs, self.gen.n_latent, self.gen.style_dim).to(device)) # random w
+                # self.latent.requires_grad = True
             elif self.search_space == 'Z':
                 self.latent = torch.randn(
                     (bs, 1, self.gen.style_dim),
@@ -257,6 +261,23 @@ class LatentOptimizer(torch.nn.Module):
         lr_ramp = 0.5 - 0.5 * math.cos(lr_ramp * math.pi)
         lr_ramp = lr_ramp * min(1, t / rampup)
         return initial_lr * lr_ramp
+
+
+    def z_to_w(self, latent_z):
+        if self.search_space == "W":
+            latent_w = self.lrelu(latent_z * self.gaussian_fit["std"] +
+                                  self.gaussian_fit["mean"]).repeat(1, self.gen.n_latent, 1)
+            # latent_w = self.latent_z
+            # latent_w = self.mpl(self.latent_z)
+            # latent_w = self.lrelu(self.latent_z * self.gaussian_fit["std"] + self.gaussian_fit["mean"])
+        elif self.search_space == "W+":
+            # latent_w = self.lrelu(self.latent)
+            latent_w = self.lrelu(self.latent * self.gaussian_fit["std"] + self.gaussian_fit["mean"])
+            # latent_w = self.latent
+            # latent_w = self.lrelu((self.W_inv.unsqueeze(0).bmm(latent_z.permute(0, 2, 1))).permute(0, 2, 1) + self.mu)
+        else:
+            latent_w = self.gen.style(latent_z)
+        return latent_w
 
 
     def invert_(self, start_layer, noise_list, steps, res, verbose=False, project=False):
@@ -303,16 +324,8 @@ class LatentOptimizer(torch.nn.Module):
             lr = self.lr * (0.1**(start_layer))
             optimizer.param_groups[0]["lr"] = lr
             self.lr_record.append(lr)
-            if self.search_space == "W":
-                latent_w = self.lrelu(self.latent* self.gaussian_fit["std"] + self.gaussian_fit["mean"]).repeat(1, self.gen.n_latent, 1)
-                # latent_w = self.latent_z
-                # latent_w = self.mpl(self.latent_z)
-                # latent_w = self.lrelu(self.latent_z * self.gaussian_fit["std"] + self.gaussian_fit["mean"])
-            elif self.search_space == "W+":
-                # latent_w = self.lrelu(self.latent)
-                latent_w = self.lrelu(self.latent * self.gaussian_fit["std"] + self.gaussian_fit["mean"])
-            else:
-                latent_w = self.gen.style(self.latent_z)
+
+            latent_w = self.z_to_w(self.latent)
             img_gen, _ = self.gen([latent_w],
                                   input_is_latent=True,
                                   noise=self.noises,
@@ -396,6 +409,7 @@ class LatentOptimizer(torch.nn.Module):
                 loss = loss + self.r_alpha * r_loss
             elif self.search_space in ["W+"]:
                 r_loss = loss_geocross(latent_w[:, 2 * start_layer:], self.gen.style_dim)
+                # r_loss = ((self.plrelu(latent_w)-self.mu) @ self.W).pow(2).mean()
                 loss = loss + self.r_alpha * r_loss
             else:
                 r_loss = torch.tensor(0., device='cuda')
@@ -443,11 +457,7 @@ class LatentOptimizer(torch.nn.Module):
                 break
         # TODO: check what happens when we are in the last layer
         with torch.no_grad():
-            # latent_w = self.mpl(self.latent_z)
-            if self.search_space == "W":
-                latent_w = self.lrelu(self.latent).repeat(1, self.gen.n_latent, 1)
-            if self.search_space == 'W+':
-                latent_w = self.lrelu(self.latent)
+            latent_w = self.z_to_w(self.latent)
             self.gen.end_layer = self.gen.start_layer
             intermediate_out, _  = self.gen([latent_w],
                                              input_is_latent=True,
